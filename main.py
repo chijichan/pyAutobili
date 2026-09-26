@@ -20,7 +20,13 @@ from pathlib import Path
 
 from bilibili.client import BiliClient, BiliError, LoginError
 from bilibili.state import load_state, save_state
-from bilibili.tasks import check_login, claim_vip_exp, donate_coins, watch_and_share
+from bilibili.tasks import (
+    check_login,
+    claim_vip_exp,
+    donate_coins,
+    get_task_status,
+    watch_and_share,
+)
 from bilibili.utils import setup_logging
 
 logger = logging.getLogger("bili")
@@ -69,8 +75,10 @@ def main():
     try:
         if "nav" in tasks:
             check_login(client)
+        # 先查今日任务状态：已完成的动作直接跳过，减少无谓请求与风控暴露
+        status = get_task_status(client)
         if "watch" in tasks:
-            watch_and_share(client, state)  # 观看 + 分享一体
+            watch_and_share(client, state, status)  # 观看 + 分享一体
         if "coin" in tasks:
             donate_coins(client, cfg["up_ids"], cfg["coin_target"], state)
         if "vip" in tasks:

@@ -1,8 +1,7 @@
 """运行状态持久化（state.json，与 config.json 同级，不含任何机密）。
 
-用途：
-- 投币黑名单：记录「该视频不接受投币」（34003）的 aid，避免每天重复试同一批视频；
-- 分享熔断：分享连续失败达阈值则暂停若干天，给账号降温（账号安全优先于经验）。
+用途：投币黑名单——记录「该视频不接受投币」（34003）的 aid，
+避免每天重复试同一批视频、白等随机间隔。
 """
 import json
 import logging
@@ -13,9 +12,8 @@ logger = logging.getLogger("bili")
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "state.json"
 
-COIN_BLOCK_DAYS = 30        # 投币黑名单有效期（天）
-SHARE_PAUSE_AFTER_DAYS = 3  # 分享连续失败多少天后暂停
-SHARE_PAUSE_DAYS = 7        # 暂停天数
+COIN_BLOCK_DAYS = 30  # 投币黑名单有效期（天）
+
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
@@ -62,37 +60,18 @@ def block_coin(state: dict, aid: int, code, message: str) -> None:
     info["at"] = _today().isoformat()
 
 
-# ---------------- 分享熔断 ----------------
-def share_paused(state: dict):
-    """分享是否处于暂停期。返回 (是否暂停, 恢复日期或 None)。"""
-    until = state.get("share_skip_until")
-    if not until:
-        return False, None
-    try:
-        if date.fromisoformat(str(until)) > _today():
-            return True, str(until)
-    except (ValueError, TypeError):
-        pass
-    return False, None
-
-
+# ---------------- 分享结果记录（仅记录，不做熔断）----------------
+# 实测：share/add 的 -403 是**间歇性**风控拒绝，不是永久封锁——2026-09-13 同一天内
+# 失败一次、1.5 分钟后再试即成功，当天 4/5 成功；09-26 则约 1/10 成功（风控收紧）。
+# 因此正确策略是「换个时段再试」，而不是长期停用分享（那样只会白丢经验）。
 def record_share(state: dict, ok: bool, code=None, message=None) -> None:
-    """记录分享结果；连续失败达阈值则进入暂停期。"""
+    """记录分享结果，便于观察成功/失败趋势。"""
+    info = state.setdefault("share", {})
+    info["last_at"] = _today().isoformat()
+    info["last_code"] = code
+    info["last_message"] = message
     if ok:
-        if state.pop("share_fail_streak", None):
-            logger.info("分享已恢复，清除连续失败计数")
-        state.pop("share_skip_until", None)
-        return
-    streak = int(state.get("share_fail_streak", 0)) + 1
-    state["share_fail_streak"] = streak
-    state["share_last_code"] = code
-    state["share_last_message"] = message
-    state["share_last_at"] = _today().isoformat()
-    if streak >= SHARE_PAUSE_AFTER_DAYS:
-        until = (_today() + timedelta(days=SHARE_PAUSE_DAYS)).isoformat()
-        state["share_skip_until"] = until
-        state["share_fail_streak"] = 0
-        logger.warning(
-            "分享已连续失败 %s 天，暂停至 %s，期间只做观看不做分享（给账号降温）",
-            SHARE_PAUSE_AFTER_DAYS, until,
-        )
+        info["last_ok_at"] = info["last_at"]
+        info["fail_streak"] = 0
+    else:
+        info["fail_streak"] = int(info.get("fail_streak", 0)) + 1

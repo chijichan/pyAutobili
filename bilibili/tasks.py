@@ -6,17 +6,18 @@
        -> archive/coins 查是否已投 -> coin/add 投币
 - 大会员：vip/experience/add 领取每日经验（等级加速包）
 
-实测结论（2026-09-26 验证，见 README 排障章节）：
+实测结论（2026-09-13 / 09-26 对比验证，见 README 排障章节）：
 - 部分老视频每视频只允许投 1 枚，投 2 枚返回 34003 → 自动降级为 1 枚重试；
-- share/add 的 -403「账号异常」为账号级风控，与 buvid4 / bili_ticket / Referer 无关，
-  重试无法穿透（5/5 全失败）→ 不重试，改为连续失败多次后暂停分享。
+- share/add 的 -403「账号异常」是**间歇性风控拒绝**，不是永久封锁：09-13 同一天失败一次后
+  1.5 分钟重试即成功（当天 4/5 成功），09-26 则约 1/10 成功（风控收紧）。紧凑重试无效
+  （连续 5 次全 -403），正确做法是换时段再跑，因此不再做「连续失败即暂停 7 天」的熔断。
 """
 import logging
 import random
 import time
 
 from .client import BiliError, LoginError
-from .state import block_coin, blocked_aids, record_share, share_paused
+from .state import block_coin, blocked_aids, record_share
 from .utils import sleep_random
 
 logger = logging.getLogger("bili")
@@ -45,6 +46,32 @@ def check_login(client):
     return data
 
 
+def get_task_status(client) -> dict:
+    """查询今日任务完成状态。
+
+    `GET /x/member/web/exp/reward` 返回：
+    {"login":true,"watch":true,"coins":50,"share":true,"email":true,...}
+    - login/watch/share：布尔，今日是否已完成（每日北京时间 0 点重置）
+    - coins：今日投币获得的经验（50 = 已满，每枚币 10 经验）
+
+    用途：已完成的动作直接跳过。实测对已完成的分享任务再调 share/add，
+    服务端返回 `-403 账号异常,操作失败`（并非账号被封，而是重复调用被拒）。
+    """
+    j = client.get("/x/member/web/exp/reward")
+    if j.get("code") != 0:
+        logger.warning("获取今日任务状态失败: %s", j)
+        return {}
+    d = j.get("data") or {}
+    logger.info(
+        "今日任务状态: 登录%s 观看%s 分享%s 投币经验%s",
+        "✓" if d.get("login") else "✗",
+        "✓" if d.get("watch") else "✗",
+        "✓" if d.get("share") else "✗",
+        d.get("coins"),
+    )
+    return d
+
+
 def _heartbeat(client, aid, bvid, cid, played, start_ts):
     return client.post("/x/click-interface/web/heartbeat", data={
         "bvid": bvid,
@@ -60,11 +87,20 @@ def _heartbeat(client, aid, bvid, cid, played, start_ts):
     }, headers=_video_headers(bvid))
 
 
-def watch_and_share(client, state=None):
-    """观看一个热门视频并分享（观看 +5 经验，分享 +5 经验）。返回所用视频信息 dict。"""
+def watch_and_share(client, state=None, status=None):
+    """观看一个热门视频并分享（观看 +5 经验，分享 +5 经验）。返回所用视频信息 dict。
+
+    status 为 get_task_status() 的结果：已完成的动作直接跳过，不做无用请求。
+    """
     state = state if state is not None else {}
+    status = status if status is not None else {}
     if not client.csrf:
         raise BiliError("Cookie 缺少 bili_jct，无法完成分享/投币，请重新抓取完整 Cookie")
+
+    # 分享已完成：直接返回，不再调用 share/add（重复调用只会得到 -403）
+    if status.get("share"):
+        logger.info("分享任务今日已完成（share=true），跳过分享请求")
+        return None
 
     j = client.get("/x/web-interface/ranking/v2", params={"rid": 0, "type": "all"})
     if j.get("code") != 0:
@@ -73,38 +109,39 @@ def watch_and_share(client, state=None):
     aid, bvid = video["aid"], video["bvid"]
     logger.info("选中视频: %s (%s)", video.get("title", bvid), bvid)
 
-    j = client.get("/x/web-interface/view", params={"bvid": bvid})
-    if j.get("code") != 0:
-        raise BiliError(f"获取视频信息失败: {j}")
-    view = j["data"]
-    cid = view.get("cid")
-    duration = int(view.get("duration") or 0)
+    if not status.get("watch"):
+        j = client.get("/x/web-interface/view", params={"bvid": bvid})
+        if j.get("code") != 0:
+            raise BiliError(f"获取视频信息失败: {j}")
+        view = j["data"]
+        cid = view.get("cid")
+        duration = int(view.get("duration") or 0)
 
-    # 心跳分两次上报，played_time 与真实流逝时间一致（不做"0 秒看完 639 秒"的假账）
-    target = min(duration, random.randint(*WATCH_TOTAL)) if duration else random.randint(*WATCH_TOTAL)
-    target = max(target, 1)
-    first = max(int(target * random.uniform(0.3, 0.6)), 1)
-    start_ts = int(time.time())
-    logger.info("开始模拟观看: 目标 %ss（视频总长 %ss）", target, duration)
+        # 心跳分两次上报，played_time 与真实流逝时间一致（不做"0 秒看完 639 秒"的假账）
+        target = min(duration, random.randint(*WATCH_TOTAL)) if duration else random.randint(*WATCH_TOTAL)
+        target = max(target, 1)
+        first = max(int(target * random.uniform(0.3, 0.6)), 1)
+        start_ts = int(time.time())
+        logger.info("开始模拟观看: 目标 %ss（视频总长 %ss）", target, duration)
 
-    time.sleep(first)
-    h1 = _heartbeat(client, aid, bvid, cid, first, start_ts)
-    if h1.get("code") != 0:
-        raise BiliError(f"观看心跳上报失败: {h1}")
-    logger.info("观看心跳1 OK: played_time=%ss", first)
+        time.sleep(first)
+        h1 = _heartbeat(client, aid, bvid, cid, first, start_ts)
+        if h1.get("code") != 0:
+            raise BiliError(f"观看心跳上报失败: {h1}")
+        logger.info("观看心跳1 OK: played_time=%ss", first)
 
-    time.sleep(max(target - first, 1))
-    h2 = _heartbeat(client, aid, bvid, cid, target, start_ts)
-    if h2.get("code") != 0:
-        raise BiliError(f"观看心跳上报失败: {h2}")
-    logger.info("观看心跳2 OK: played_time=%ss（观看任务完成）", target)
+        time.sleep(max(target - first, 1))
+        h2 = _heartbeat(client, aid, bvid, cid, target, start_ts)
+        if h2.get("code") != 0:
+            raise BiliError(f"观看心跳上报失败: {h2}")
+        logger.info("观看心跳2 OK: played_time=%ss（观看任务完成）", target)
+    else:
+        logger.info("观看任务今日已完成（watch=true），跳过观看心跳")
 
-    # ---- 分享（受账号级风控影响，失败不影响其它任务）----
-    paused, until = share_paused(state)
-    if paused:
-        logger.info("分享处于暂停期（至 %s），本次跳过分享", until)
-        return video
-
+    # ---- 分享 ----
+    # 实测（2026-09-13 vs 09-26）：share/add 的 -403 是**间歇性**风控拒绝，
+    # 同一天内可能这次失败、1.5 分钟后重试就成功。所以策略是「失败就下次运行再试」，
+    # 而不是紧凑循环重试（紧凑重试已被实测证明无效：连续 5 次全 -403）。
     sleep_random(5, 12)
     r = client.post("/x/web-interface/share/add",
                     data={"bvid": bvid, "csrf": client.csrf},
@@ -117,8 +154,8 @@ def watch_and_share(client, state=None):
         record_share(state, False, code, r.get("message"))
         if code == -403:
             logger.warning(
-                "分享失败: -403 账号异常（账号级风控，实测与 buvid4/bili_ticket/Referer 无关，"
-                "重试无效）→ 不重试，仅累计失败天数"
+                "分享被风控拒绝: -403 账号异常（间歇性，非永久封锁）。"
+                "建议稍后换个时段再跑一次 --task watch 重试，不要连续重试"
             )
         else:
             logger.warning("分享失败: code=%s message=%s", code, r.get("message"))
