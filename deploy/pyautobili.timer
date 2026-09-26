@@ -1,0 +1,11 @@
+[Unit]
+Description=每天 10:05 触发 pyAutobili 每日任务
+
+[Timer]
+# 每天 10:05 执行；RandomizedDelaySec 让请求节奏不固定
+OnCalendar=*-*-* 10:05:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

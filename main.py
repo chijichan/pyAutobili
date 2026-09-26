@@ -1,10 +1,11 @@
 """B 站每日任务脚本入口（curl_cffi 轻量级浏览器模拟）。
 
 用法：
-    python main.py                      # 依次执行: nav -> watch/share -> coin
+    python main.py                      # 依次执行: nav -> watch/share -> coin -> vip
     python main.py --task nav           # 只校验登录（验证 TLS 指纹是否通过）
     python main.py --task watch         # 观看+分享（一体）
     python main.py --task coin          # 投币
+    python main.py --task vip           # 大会员等级加速包（每日经验）
     python main.py --verbose            # 输出 Debug 级日志
 
 配置优先级：环境变量 > config.json > 默认值。
@@ -18,12 +19,13 @@ import sys
 from pathlib import Path
 
 from bilibili.client import BiliClient, BiliError, LoginError
-from bilibili.tasks import check_login, donate_coins, watch_and_share
+from bilibili.state import load_state, save_state
+from bilibili.tasks import check_login, claim_vip_exp, donate_coins, watch_and_share
 from bilibili.utils import setup_logging
 
 logger = logging.getLogger("bili")
 
-ALL_TASKS = ("nav", "watch", "coin")
+ALL_TASKS = ("nav", "watch", "coin", "vip")
 
 
 def load_config(path=None):
@@ -53,7 +55,7 @@ def main():
         epilog="示例: python main.py --task nav && python main.py",
     )
     parser.add_argument("--task", action="append", choices=ALL_TASKS,
-                        help="要执行的任务，可重复指定；默认全部 (nav/watch/coin)")
+                        help="要执行的任务，可重复指定；默认全部 (nav/watch/coin/vip)")
     parser.add_argument("--config", help="配置文件路径（默认 ./config.json）")
     parser.add_argument("--verbose", action="store_true", help="输出 Debug 级日志")
     args = parser.parse_args()
@@ -63,13 +65,16 @@ def main():
     tasks = args.task or list(ALL_TASKS)
 
     client = BiliClient(cfg["cookie"])
+    state = load_state()
     try:
         if "nav" in tasks:
             check_login(client)
         if "watch" in tasks:
-            watch_and_share(client)  # 观看 + 分享一体
+            watch_and_share(client, state)  # 观看 + 分享一体
         if "coin" in tasks:
-            donate_coins(client, cfg["up_ids"], cfg["coin_target"])
+            donate_coins(client, cfg["up_ids"], cfg["coin_target"], state)
+        if "vip" in tasks:
+            claim_vip_exp(client)
     except LoginError as e:
         logger.error("登录失效，请重新抓取 Cookie: %s", e)
         sys.exit(1)
@@ -79,6 +84,8 @@ def main():
     except Exception:
         logger.exception("未预期异常")
         sys.exit(1)
+    finally:
+        save_state(state)  # 黑名单/熔断状态即使中途出错也要落盘
     logger.info("全部任务完成")
 
 

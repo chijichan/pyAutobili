@@ -2,6 +2,7 @@
 config.json
 .env
 .env.*
+state.json
 logs/
 *.log
 

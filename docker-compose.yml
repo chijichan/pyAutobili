@@ -1,0 +1,16 @@
+services:
+  pyautobili:
+    build: .
+    image: pyautobili:latest
+    container_name: pyautobili
+    restart: "no"
+    environment:
+      TZ: Asia/Shanghai
+      # 也可改为挂载 config.json（见下方 volumes 注释）
+      BILI_COOKIE: "${BILI_COOKIE}"
+      UP_IDS: "${UP_IDS:-2,928123}"
+    volumes:
+      - ./logs:/app/logs
+      # - ./config.json:/app/config.json:ro
+    # 群晖/威联通 NAS 可用「计划任务 → 定时执行 docker compose run」触发，或宿主机 cron 调用:
+    #   docker compose run --rm pyautobili
