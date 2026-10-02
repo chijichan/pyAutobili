@@ -19,7 +19,12 @@ import sys
 from pathlib import Path
 
 from bilibili.client import BiliClient, BiliError, LoginError
-from bilibili.state import load_state, save_state
+from bilibili.state import (
+    acknowledge_risk_recovery,
+    load_state,
+    risk_rejected_today,
+    save_state,
+)
 from bilibili.tasks import (
     check_login,
     claim_vip_exp,
@@ -64,6 +69,11 @@ def main():
                         help="要执行的任务，可重复指定；默认全部 (nav/watch/coin/vip)")
     parser.add_argument("--config", help="配置文件路径（默认 ./config.json）")
     parser.add_argument("--verbose", action="store_true", help="输出 Debug 级日志")
+    parser.add_argument(
+        "--confirm-risk-recovered",
+        action="store_true",
+        help="人工确认账号已恢复后，每天临时清除一次本地熔断；新 -403 仍会立即熔断",
+    )
     args = parser.parse_args()
 
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
@@ -72,6 +82,11 @@ def main():
 
     client = BiliClient(cfg["cookie"])
     state = load_state()
+    if args.confirm_risk_recovered:
+        if acknowledge_risk_recovery(state):
+            logger.warning("已清除今天的本地风控熔断；本次运行若再次收到 -403，会重新停止写操作")
+        else:
+            logger.info("没有需要清除的当日风控熔断")
     try:
         if "nav" in tasks:
             check_login(client)
@@ -82,7 +97,10 @@ def main():
         if "coin" in tasks:
             donate_coins(client, cfg["up_ids"], cfg["coin_target"], state)
         if "vip" in tasks:
-            claim_vip_exp(client)
+            if risk_rejected_today(state):
+                logger.warning("今天已有 -403 风控拒绝，跳过 VIP 写请求")
+            else:
+                claim_vip_exp(client)
     except LoginError as e:
         logger.error("登录失效，请重新抓取 Cookie: %s", e)
         sys.exit(1)
@@ -93,6 +111,8 @@ def main():
         logger.exception("未预期异常")
         sys.exit(1)
     finally:
+        if args.confirm_risk_recovered and not risk_rejected_today(state):
+            state.pop("risk_pause_acknowledged_at", None)
         save_state(state)  # 黑名单/熔断状态即使中途出错也要落盘
     logger.info("全部任务完成")
 

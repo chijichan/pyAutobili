@@ -6,18 +6,22 @@
        -> archive/coins 查是否已投 -> coin/add 投币
 - 大会员：vip/experience/add 领取每日经验（等级加速包）
 
-实测结论（2026-09-13 / 09-26 对比验证，见 README 排障章节）：
-- 部分老视频每视频只允许投 1 枚，投 2 枚返回 34003 → 自动降级为 1 枚重试；
-- share/add 的 -403「账号异常」是**间歇性风控拒绝**，不是永久封锁：09-13 同一天失败一次后
-  1.5 分钟重试即成功（当天 4/5 成功），09-26 则约 1/10 成功（风控收紧）。紧凑重试无效
-  （连续 5 次全 -403），正确做法是换时段再跑，因此不再做「连续失败即暂停 7 天」的熔断。
+风控响应处理：分享当天收到 -403 后不再重试；投币收到首次 -403 后立即停止，且当天后续
+运行也跳过相关写操作。不要通过换视频或反复运行来测试风控窗口。
 """
 import logging
 import random
 import time
 
 from .client import BiliError, LoginError
-from .state import block_coin, blocked_aids, record_share
+from .state import (
+    block_coin,
+    blocked_aids,
+    pause_coin,
+    record_share,
+    risk_rejected_today,
+    share_blocked_today,
+)
 from .utils import sleep_random
 
 logger = logging.getLogger("bili")
@@ -25,9 +29,7 @@ logger = logging.getLogger("bili")
 # 随机间隔区间（秒）
 COIN_SLEEP = (10, 25)
 NEXT_UP_SLEEP = (15, 30)
-COIN_403_SLEEP = (30, 60)   # 命中风控后拉长间隔
 WATCH_TOTAL = (20, 35)      # 模拟观看的总时长（心跳上报值与此一致，避免"瞬间看完全片"的机器人特征）
-COIN_403_LIMIT = 3          # 连续 -403 达此次数即提前结束投币任务
 
 
 def _video_headers(bvid):
@@ -101,6 +103,9 @@ def watch_and_share(client, state=None, status=None):
     if status.get("share"):
         logger.info("分享任务今日已完成（share=true），跳过分享请求")
         return None
+    if share_blocked_today(state):
+        logger.warning("分享今天已被 -403 拒绝，跳过自动重试")
+        return None
 
     j = client.get("/x/web-interface/ranking/v2", params={"rid": 0, "type": "all"})
     if j.get("code") != 0:
@@ -139,9 +144,6 @@ def watch_and_share(client, state=None, status=None):
         logger.info("观看任务今日已完成（watch=true），跳过观看心跳")
 
     # ---- 分享 ----
-    # 实测（2026-09-13 vs 09-26）：share/add 的 -403 是**间歇性**风控拒绝，
-    # 同一天内可能这次失败、1.5 分钟后重试就成功。所以策略是「失败就下次运行再试」，
-    # 而不是紧凑循环重试（紧凑重试已被实测证明无效：连续 5 次全 -403）。
     sleep_random(5, 12)
     r = client.post("/x/web-interface/share/add",
                     data={"bvid": bvid, "csrf": client.csrf},
@@ -154,8 +156,7 @@ def watch_and_share(client, state=None, status=None):
         record_share(state, False, code, r.get("message"))
         if code == -403:
             logger.warning(
-                "分享被风控拒绝: -403 账号异常（间歇性，非永久封锁）。"
-                "建议稍后换个时段再跑一次 --task watch 重试，不要连续重试"
+                "分享被风控拒绝: -403 账号异常；今天不再自动重试，请检查账号状态"
             )
         else:
             logger.warning("分享失败: code=%s message=%s", code, r.get("message"))
@@ -168,6 +169,10 @@ def donate_coins(client, up_ids, target: int = 5, state=None):
     返回本次实际投出的币数。
     """
     state = state if state is not None else {}
+    if risk_rejected_today(state):
+        logger.warning("今天已有 -403 风控拒绝，跳过自动投币")
+        return 0
+
     today = client.get("/x/web-interface/coin/today/exp")
     if today.get("code") != 0:
         raise BiliError(f"获取今日投币情况失败: {today}")
@@ -192,7 +197,6 @@ def donate_coins(client, up_ids, target: int = 5, state=None):
         logger.info("按 state.json 黑名单跳过 %s 个不可投币视频", len(blocked))
 
     done = 0
-    streak_403 = 0
     stop = False
     for uid in up_ids:
         if done >= need or stop:
@@ -241,22 +245,17 @@ def donate_coins(client, up_ids, target: int = 5, state=None):
 
             if code == 0:
                 done += multiply
-                streak_403 = 0
                 logger.info("已给 aid=%s 投 %s 枚 (%s)", aid, multiply, v.get("title", ""))
                 sleep_random(*COIN_SLEEP)
             elif code == -403:
-                streak_403 += 1
-                logger.warning("投币被风控拦截 aid=%s: -403 账号异常（连续 %s 次）", aid, streak_403)
-                if streak_403 >= COIN_403_LIMIT:
-                    logger.error(
-                        "连续 %s 次 -403，提前结束投币任务以免加重风控（今日已投 %s 枚）",
-                        streak_403, done,
-                    )
-                    stop = True
-                    break
-                sleep_random(*COIN_403_SLEEP)
+                pause_coin(state, code, r.get("message"))
+                logger.error(
+                    "投币被风控拦截 aid=%s: -403；立即停止并暂停今天的自动投币（今日已投 %s 枚）",
+                    aid, done,
+                )
+                stop = True
+                break
             else:
-                streak_403 = 0
                 if code == 34003:
                     block_coin(state, aid, code, r.get("message"))
                     logger.warning("aid=%s 不可投币(%s %s)，已记入黑名单，后续跳过",

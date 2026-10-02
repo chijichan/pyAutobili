@@ -60,16 +60,62 @@ def block_coin(state: dict, aid: int, code, message: str) -> None:
     info["at"] = _today().isoformat()
 
 
-# ---------------- 分享结果记录（仅记录，不做熔断）----------------
-# 实测：share/add 的 -403 是**间歇性**风控拒绝，不是永久封锁——2026-09-13 同一天内
-# 失败一次、1.5 分钟后再试即成功，当天 4/5 成功；09-26 则约 1/10 成功（风控收紧）。
-# 因此正确策略是「换个时段再试」，而不是长期停用分享（那样只会白丢经验）。
+# ---------------- 风控拒绝记录 ----------------
+def share_blocked_today(state: dict) -> bool:
+    """分享被 -403 拒绝后，当天不再自动重试。"""
+    info = state.get("share") or {}
+    today = _today().isoformat()
+    return (
+        info.get("last_code") == -403
+        and info.get("last_at") == today
+        and state.get("risk_pause_acknowledged_at") != today
+    )
+
+
+def coin_paused_today(state: dict) -> bool:
+    """投币被 -403 拒绝后，当天不再自动尝试。"""
+    info = state.get("coin_risk_pause") or {}
+    today = _today().isoformat()
+    return (
+        info.get("at") == today
+        and state.get("risk_pause_acknowledged_at") != today
+    )
+
+
+def risk_rejected_today(state: dict) -> bool:
+    """任一分享或投币写请求被拒绝后，当天不再执行其它写操作。"""
+    return share_blocked_today(state) or coin_paused_today(state)
+
+
+def acknowledge_risk_recovery(state: dict) -> bool:
+    """人工确认恢复后，本地熔断每天最多临时清除一次。"""
+    today = _today().isoformat()
+    if state.get("risk_pause_override_used_at") == today:
+        return False
+    if not (share_blocked_today(state) or coin_paused_today(state)):
+        return False
+    state["risk_pause_acknowledged_at"] = today
+    state["risk_pause_override_used_at"] = today
+    return True
+
+
+def pause_coin(state: dict, code, message: str) -> None:
+    state.pop("risk_pause_acknowledged_at", None)
+    state["coin_risk_pause"] = {
+        "at": _today().isoformat(),
+        "code": code,
+        "message": message,
+    }
+
+
 def record_share(state: dict, ok: bool, code=None, message=None) -> None:
-    """记录分享结果，便于观察成功/失败趋势。"""
+    """记录分享结果；-403 会阻止当天后续自动尝试。"""
     info = state.setdefault("share", {})
     info["last_at"] = _today().isoformat()
     info["last_code"] = code
     info["last_message"] = message
+    if code == -403:
+        state.pop("risk_pause_acknowledged_at", None)
     if ok:
         info["last_ok_at"] = info["last_at"]
         info["fail_streak"] = 0
