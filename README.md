@@ -60,11 +60,16 @@ python main.py                 # 全部任务：登录校验 -> 观看+分享 ->
 python main.py --task coin     # 只投币
 python main.py --task vip      # 只领大会员等级加速包
 python main.py --verbose       # Debug 日志（请求/响应细节，排障用）
+python main.py --resident      # 常驻进程，每天本地时间 10:05 执行，Ctrl+C 退出
 # 官网人工确认账号恢复后，清除当日旧熔断并只运行投币
 python main.py --task coin --confirm-risk-recovered
 ```
 
 日志输出到控制台，同时写入 `logs\bili.log`（2MB 滚动保留 3 份）。
+
+`--resident` 启动后会等待下一个本地时间 10:05，再每日运行所选任务；启动不会立即执行。
+进程必须持续运行，电脑/服务器需保持开机且不能休眠。进程或设备停止期间错过的运行不会补执行；
+此模式本身也不会在重启后自动启动。
 
 ### 配置项
 

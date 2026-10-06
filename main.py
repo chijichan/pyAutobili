@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from bilibili.client import BiliClient, BiliError, LoginError
@@ -60,29 +62,21 @@ def load_config(path=None):
     return {"cookie": cookie, "up_ids": up_ids, "coin_target": coin_target}
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="B 站每日任务（curl_cffi 轻量级浏览器模拟）",
-        epilog="示例: python main.py --task nav && python main.py",
-    )
-    parser.add_argument("--task", action="append", choices=ALL_TASKS,
-                        help="要执行的任务，可重复指定；默认全部 (nav/watch/coin/vip)")
-    parser.add_argument("--config", help="配置文件路径（默认 ./config.json）")
-    parser.add_argument("--verbose", action="store_true", help="输出 Debug 级日志")
-    parser.add_argument(
-        "--confirm-risk-recovered",
-        action="store_true",
-        help="人工确认账号已恢复后，每天临时清除一次本地熔断；新 -403 仍会立即熔断",
-    )
-    args = parser.parse_args()
+def seconds_until_next_run(now=None, last_run_date=None):
+    now = now or datetime.now()
+    next_run = now.replace(hour=10, minute=5, second=0, microsecond=0)
+    if last_run_date is not None and next_run.date() <= last_run_date:
+        next_run = datetime.combine(last_run_date + timedelta(days=1), now.min.time())
+        next_run = next_run.replace(hour=10, minute=5)
+    elif next_run <= now:
+        next_run += timedelta(days=1)
+    return (next_run - now).total_seconds(), next_run
 
-    setup_logging(logging.DEBUG if args.verbose else logging.INFO)
-    cfg = load_config(args.config)
-    tasks = args.task or list(ALL_TASKS)
 
+def run_once(cfg, tasks, confirm_risk_recovered=False):
     client = BiliClient(cfg["cookie"])
     state = load_state()
-    if args.confirm_risk_recovered:
+    if confirm_risk_recovered:
         if acknowledge_risk_recovery(state):
             logger.warning("已清除今天的本地风控熔断；本次运行若再次收到 -403，会重新停止写操作")
         else:
@@ -103,19 +97,66 @@ def main():
                 claim_vip_exp(client)
     except LoginError as e:
         logger.error("登录失效，请重新抓取 Cookie: %s", e)
-        sys.exit(1)
+        return False
     except BiliError as e:
         logger.error("任务失败: %s", e)
-        sys.exit(1)
+        return False
     except Exception:
         logger.exception("未预期异常")
-        sys.exit(1)
+        return False
     finally:
-        if args.confirm_risk_recovered and not risk_rejected_today(state):
+        if confirm_risk_recovered and not risk_rejected_today(state):
             state.pop("risk_pause_acknowledged_at", None)
         save_state(state)  # 黑名单/熔断状态即使中途出错也要落盘
-    logger.info("全部任务完成")
+    logger.info("本轮任务完成")
+    return True
+
+
+def run_resident(cfg, tasks):
+    logger.info("常驻模式已启动，每天本地时间 10:05 执行；Ctrl+C 退出")
+    last_run_date = None
+    try:
+        while True:
+            _, next_run = seconds_until_next_run(last_run_date=last_run_date)
+            logger.info("下次执行时间: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
+            while True:
+                delay = (next_run - datetime.now()).total_seconds()
+                if delay <= 0:
+                    break
+                time.sleep(min(delay, 60))
+            last_run_date = datetime.now().date()
+            run_once(cfg, tasks)
+    except KeyboardInterrupt:
+        logger.info("收到 Ctrl+C，常驻模式已退出")
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="B 站每日任务（curl_cffi 轻量级浏览器模拟）",
+        epilog="示例: python main.py --task nav && python main.py",
+    )
+    parser.add_argument("--task", action="append", choices=ALL_TASKS,
+                        help="要执行的任务，可重复指定；默认全部 (nav/watch/coin/vip)")
+    parser.add_argument("--config", help="配置文件路径（默认 ./config.json）")
+    parser.add_argument("--verbose", action="store_true", help="输出 Debug 级日志")
+    parser.add_argument("--resident", action="store_true", help="常驻进程，每天本地时间 10:05 执行")
+    parser.add_argument(
+        "--confirm-risk-recovered",
+        action="store_true",
+        help="人工确认账号已恢复后，每天临时清除一次本地熔断；新 -403 仍会立即熔断",
+    )
+    args = parser.parse_args()
+
+    setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+    cfg = load_config(args.config)
+    tasks = args.task or list(ALL_TASKS)
+    if args.resident:
+        if args.confirm_risk_recovered:
+            parser.error("--resident 不能与 --confirm-risk-recovered 同时使用")
+        return run_resident(cfg, tasks)
+    return 0 if run_once(cfg, tasks, args.confirm_risk_recovered) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
